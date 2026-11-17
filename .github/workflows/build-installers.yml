@@ -1,0 +1,257 @@
+name: Build installers
+
+# Release:  push a tag v1.2.3   –or–   Actions → Build installers → Run workflow, version = 1.2.3
+# Test only: Actions → Run workflow with the version box empty (builds + self-tests, no release)
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 1.0.0 (creates tag v1.0.0 + GitHub release). Leave empty to only build and test."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: installers-${{ github.ref }}-${{ github.event.inputs.version }}
+  cancel-in-progress: false
+
+env:
+  APP: HDMEA-Analysis
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      numeric: ${{ steps.v.outputs.numeric }}
+      tag: ${{ steps.v.outputs.tag }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - id: v
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"; release=true
+          elif [ -n "${INPUT_VERSION// /}" ]; then
+            v="${INPUT_VERSION// /}"; v="${v#v}"; release=true
+          else
+            v="0.0.0-dev.${GITHUB_RUN_NUMBER}"; release=false
+          fi
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version '$v' is not like 1.2.3"; exit 1
+          fi
+          numeric="$(echo "$v" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+          {
+            echo "version=$v"; echo "numeric=$numeric"; echo "tag=v$v"; echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version $v (release: $release)"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows
+            file: Windows-setup.exe
+          - os: macos-15
+            label: macOS-AppleSilicon
+            file: macOS-AppleSilicon.pkg
+            arch: arm64
+          - os: macos-15-intel
+            label: macOS-Intel
+            file: macOS-Intel.pkg
+            arch: x86_64
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      NUMVER: ${{ needs.version.outputs.numeric }}
+      OUTFILE: HDMEA-Analysis-${{ needs.version.outputs.version }}-${{ matrix.file }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Write version into the app
+        shell: bash
+        run: |
+          printf '# Written by the release workflow from the git tag.\n__version__ = "%s"\n' "$VERSION" > hdmea/_version.py
+          cat hdmea/_version.py
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Self-test from source
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m hdmea --selftest --log "$RUNNER_TEMP/selftest-source.log"
+
+      - name: Build app (PyInstaller)
+        shell: bash
+        run: pyinstaller --noconfirm HDMEA-Analysis.spec
+
+      # ---------------- self-test of the BUILT app (a broken build never gets packaged) -------------
+      - name: Self-test built app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "selftest-built.log"
+          $p = Start-Process -FilePath "dist\HDMEA-Analysis\HDMEA-Analysis.exe" -ArgumentList @("--selftest", "--log", $log) -Wait -PassThru -NoNewWindow
+          if (Test-Path $log) { Get-Content $log } else { Write-Host "no log written" }
+          if ($p.ExitCode -ne 0) { Write-Error "Self-test failed (exit $($p.ExitCode))"; exit 1 }
+
+      - name: Self-test built app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -euo pipefail
+          BIN="dist/HDMEA-Analysis.app/Contents/MacOS/HDMEA-Analysis"
+          file "$BIN"
+          file "$BIN" | grep -q "${{ matrix.arch }}" || { echo "::error::binary is not ${{ matrix.arch }}"; exit 1; }
+          set +e
+          "$BIN" --selftest --log "$RUNNER_TEMP/selftest-built.log"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/selftest-built.log" || true
+          exit $rc
+
+      # ---------------- package ----------------
+      - name: Build Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "/DAppVersion=$env:VERSION" "/DNumVersion=$env:NUMVER" "/DSourceDir=$PWD\dist\HDMEA-Analysis" "/DOutputDir=$PWD\release" installer\windows\HDMEA-Analysis.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem release
+
+      - name: Test Windows installer (silent per-user install + self-test of installed copy)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "install-test"
+          $p = Start-Process -FilePath "release\$env:OUTFILE" -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/DIR=$dir") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Error "installer exit $($p.ExitCode)"; exit 1 }
+          $log = Join-Path $env:RUNNER_TEMP "selftest-installed.log"
+          $t = Start-Process -FilePath "$dir\HDMEA-Analysis.exe" -ArgumentList @("--selftest", "--log", $log) -Wait -PassThru -NoNewWindow
+          Get-Content $log -Tail 15
+          if ($t.ExitCode -ne 0) { Write-Error "installed app self-test failed"; exit 1 }
+
+      - name: Build macOS installer (.pkg)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash installer/macos/build_pkg.sh "$NUMVER" "release/$OUTFILE"
+
+      - name: Test macOS installer (install into /Applications + self-test of installed copy)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -euo pipefail
+          sudo installer -pkg "release/$OUTFILE" -target /
+          ls -la /Applications/HDMEA-Analysis.app/Contents/MacOS/
+          set +e
+          /Applications/HDMEA-Analysis.app/Contents/MacOS/HDMEA-Analysis --selftest --log "$RUNNER_TEMP/selftest-installed.log"
+          rc=$?
+          set -e
+          tail -15 "$RUNNER_TEMP/selftest-installed.log" || true
+          exit $rc
+
+      - name: Upload self-test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-logs-${{ matrix.label }}
+          path: ${{ runner.temp }}/selftest-*.log
+          if-no-files-found: ignore
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.label }}
+          path: release/${{ env.OUTFILE }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          path: release
+          merge-multiple: true
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > notes.md <<EOF
+          ## HD-MEA Analysis ${VERSION}
+
+          Desktop app for BioCam HD-MEA retina recordings: concatenation, lux-corrected triggers, HerdingSpikes sorting, light responses, ringing, sparse-object RF mapping, RF→MEA calibration and CCF coupling.
+
+          | System | Download |
+          |---|---|
+          | Windows 10/11 (64-bit) | \`HDMEA-Analysis-${VERSION}-Windows-setup.exe\` |
+          | macOS, Apple silicon (M1–M4) | \`HDMEA-Analysis-${VERSION}-macOS-AppleSilicon.pkg\` |
+          | macOS, Intel | \`HDMEA-Analysis-${VERSION}-macOS-Intel.pkg\` |
+
+          **Opening the unsigned installers**
+          - **Windows:** if SmartScreen says "Windows protected your PC", click **More info → Run anyway**. Installs for your user only; no admin rights needed.
+          - **macOS:** if the .pkg "cannot be opened", open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**, then run the installer again. The app goes to /Applications.
+
+          HerdingSpikes is not included (it needs a C++ compiler). Without it everything works except **Run HerdingSpikes**; see the README for how to add it or load existing sortings.
+          EOF
+          cat notes.md
+          ls -la release
+
+      - name: Create or update GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(release/HDMEA-Analysis-"${VERSION}"-Windows-setup.exe release/HDMEA-Analysis-"${VERSION}"-macOS-AppleSilicon.pkg release/HDMEA-Analysis-"${VERSION}"-macOS-Intel.pkg)
+          for f in "${files[@]}"; do [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }; done
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --notes-file notes.md --title "HD-MEA Analysis ${VERSION}"
+          else
+            # creates the tag at this commit when run from "Run workflow"
+            gh release create "$TAG" "${files[@]}" --target "$GITHUB_SHA" --title "HD-MEA Analysis ${VERSION}" --notes-file notes.md
+          fi

@@ -1,0 +1,19 @@
+# Pinned versions used for the installer builds (GitHub Actions) and the Linux test build.
+# Versions chosen to have wheels for Windows x64, macOS arm64 AND macOS x86_64 on Python 3.11.
+spikeinterface==0.105.4
+neo==0.14.6
+probeinterface==0.5.0
+zarr==2.18.7
+numcodecs==0.15.1
+h5py==3.13.0
+numpy==2.2.6
+scipy==1.15.3
+pandas==2.2.3
+openpyxl==3.1.5
+matplotlib==3.10.3
+scikit-image==0.25.2
+PySide6==6.8.3
+tqdm==4.67.1
+threadpoolctl==3.6.0
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
